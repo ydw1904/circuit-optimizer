@@ -82,6 +82,7 @@ BAD_ROUTE_ROWS = [
     ("EXA,Example A,5000,2,4500,300,40", "'cargo_demand' is empty"),
     ("EXA,Bad\x07Name,5000,2,4500,300,40,500,0", "printable text"),
     ("EXA,Example A,5000,2,99999999,300,40,500,0", "between"),
+    ("EXA,Example A,5000,11,4500,300,40,500,0", "'category' must be between 1 and 10"),
 ]
 
 

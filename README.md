@@ -141,7 +141,7 @@ Two files, each `.csv` (UTF-8, comma or semicolon separated) or `.xlsx` (first s
 |`iata`|destination code|3 letters|
 |`name`|display name|text, up to 60 characters|
 |`distance_km`|distance from the hub|whole number, 1 to 20100|
-|`category`|destination category|whole number, 1 to 20|
+|`category`|destination category|whole number, 1 to 10|
 |`eco_demand`|economy demand|whole number, at least 1|
 |`bus_demand`|business demand|whole number, 0 or more|
 |`first_demand`|first class demand|whole number, 0 or more|
@@ -153,7 +153,7 @@ Two files, each `.csv` (UTF-8, comma or semicolon separated) or `.xlsx` (first s
 |Column|Meaning|Allowed|
 |-|-|-|
 |`model`|name you will use with `--only`|text, up to 60 characters, unique|
-|`category`|aircraft category (flies routes of this category or higher)|whole number, 1 to 20|
+|`category`|aircraft category (flies routes of this category or higher)|whole number, 1 to 10|
 |`speed_kmh`|cruise speed|whole number, 1 or more|
 |`range_km`|maximum range|whole number, 1 or more|
 |`max_pax`|seat capacity|whole number, 0 or more|

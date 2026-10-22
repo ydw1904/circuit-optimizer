@@ -30,7 +30,7 @@ ROUTE_COLUMNS = (
     ("iata", "iata", "iata"),
     ("name", "name", "text"),
     ("distance_km", "dist", "int", 1, 20_100),
-    ("category", "cat", "int", 1, 20),
+    ("category", "cat", "int", 1, 10),
     ("eco_demand", "eco_d", "int", 1, 1_000_000),
     ("bus_demand", "bus_d", "int", 0, 1_000_000),
     ("first_demand", "fir_d", "int", 0, 1_000_000),
@@ -39,7 +39,7 @@ ROUTE_COLUMNS = (
 )
 AIRCRAFT_COLUMNS = (
     ("model", "model", "text"),
-    ("category", "cat", "int", 1, 20),
+    ("category", "cat", "int", 1, 10),
     ("speed_kmh", "speed", "int", 1, 10_000),
     ("range_km", "range", "int", 1, 40_000),
     ("max_pax", "pax", "int", 0, 5_000),
