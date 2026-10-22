@@ -1,0 +1,943 @@
+"""Circuit planner: revenue-optimised route sets ("circuits") and seat configs.
+
+Phase 1: beam search for route combinations, scored by a quick revenue estimate.
+Phase 2: full grid search over seat config + waves + SuperSim pricing.
+
+Wave model:
+  - 1 wave = 7 aircraft, staggered Mon to Sun
+  - Each day, one aircraft visits each route in the circuit
+  - Daily flights per route = waves
+  - Capacity = 2 x seats x waves (round trip factor)
+  - Circuit time <= 168h (one rotation per week)
+
+Usage:
+    python -m circuit_optimizer --routes routes.csv --aircraft aircraft.csv --circuits 5
+"""
+
+import math, argparse, contextlib, heapq, json, sys, time as _time
+import numpy as np
+
+from . import dataio
+
+try:
+    from numba import njit
+except ImportError:
+    njit = None
+
+try:
+    from .native import optimize_circuit_native, search_circuits_native
+    _HAS_NATIVE = True
+except ImportError:
+    optimize_circuit_native = None
+    search_circuits_native = None
+    _HAS_NATIVE = False
+
+_slow_path_hint_shown = False
+
+
+def _warn_slow_path_once():
+    global _slow_path_hint_shown
+    if _HAS_NATIVE or njit is not None or _slow_path_hint_shown:
+        return
+    _slow_path_hint_shown = True
+    print("note: neither the native core nor numba is available, so this is "
+          "running the slow pure-Python path (pip install numba, or see README)",
+          file=sys.stderr)
+
+
+def flight_time_rt(distance_km, speed_kmh):
+    return math.ceil((((distance_km / speed_kmh) + 1) * 2) * 4) / 4
+
+
+
+def eligible_routes(routes, ac, exclude_iatas=(), min_dist=None, max_dist=None):
+    """Routes this aircraft can fly: in range, category high enough, one rotation <= 168h."""
+    exclude = {x.upper() for x in exclude_iatas}
+    max_range = min(ac["range"], max_dist) if max_dist else ac["range"]
+    out = []
+    for r in sorted(routes, key=lambda r: -r["dist"]):
+        if r["iata"] in exclude or r["dist"] > max_range or r["cat"] < ac["cat"]:
+            continue
+        if min_dist and r["dist"] < min_dist:
+            continue
+        ft = flight_time_rt(r["dist"], ac["speed"])
+        if ft <= 168:
+            out.append({**r, "ft": ft})
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Pricing Formulas
+# ═══════════════════════════════════════════════════════════════════
+
+def ideal_eco(dist, comfort):
+    return math.floor(100 + dist * 0.3 * (1 + comfort / 3000))
+
+def ideal_bus(dist, comfort):
+    return math.floor(ideal_eco(dist, comfort) * 1.33)
+
+def ideal_fir(dist, comfort):
+    return math.floor(ideal_eco(dist, comfort) * 2.3)
+
+def ideal_cargo(dist, speed):
+    p = 0.56 if dist <= 1999 else 0.52 if dist <= 5000 else 0.47
+    return math.ceil(200 + p * dist * (1 + speed / 500))
+
+def supersim_price(audit_price, capacity, demand):
+    if audit_price == 0 or demand == 0:
+        return 0
+    if capacity <= 0:
+        return audit_price
+    if capacity < demand:
+        return math.floor(audit_price * (1 - (capacity - demand) / (3 * demand)))
+    return audit_price
+
+def daily_turnover(audit_price, capacity, demand):
+    if capacity <= 0 or demand <= 0 or audit_price == 0:
+        return 0
+    return min(demand, capacity) * supersim_price(audit_price, capacity, demand)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  PHASE 1 - Revenue-Estimated Beam Search
+# ═══════════════════════════════════════════════════════════════════
+
+# Array-based scorer shared by the Python beam search. Plain Python by
+# default; JIT-compiled below when numba is installed (same semantics,
+# and identical to eval_config in native/beam_search.rs; keep in lockstep).
+def _eval_cfg_nb(eco, bus, fir, cargo, demands, prices,
+                 max_pax, max_ton, max_waves, overshoot_pct):
+    if eco + bus + fir + cargo == 0:
+        return 0.0
+    if eco * 0.1 + bus * 0.125 + fir * 0.15 + cargo * 1.0 > max_ton:
+        return 0.0
+    if eco * 1.0 + bus * 1.8 + fir * 4.2 > max_pax:
+        return 0.0
+    R = demands.shape[0]
+    seats0, seats1, seats2, seats3 = eco, bus, fir, cargo
+    mw_f = float(max_waves)
+    tol = 1.0 + overshoot_pct if overshoot_pct > 0.0 else 1.0
+    for r in range(R):
+        for c in range(4):
+            if c == 0: s = seats0
+            elif c == 1: s = seats1
+            elif c == 2: s = seats2
+            else: s = seats3
+            if s <= 0:
+                continue
+            d = demands[r, c]
+            if d <= 0:
+                return 0.0
+            # Eco (c=0) strict; bus/fir/cargo allow overshoot
+            allowed = d if c == 0 else d * tol
+            wl = allowed / (2.0 * s)
+            if wl < mw_f:
+                mw_f = wl
+    mw = int(math.floor(mw_f))
+    if mw < 1:
+        return 0.0
+    rev = 0.0
+    for r in range(R):
+        for c in range(4):
+            if c == 0: s = seats0
+            elif c == 1: s = seats1
+            elif c == 2: s = seats2
+            else: s = seats3
+            if s <= 0:
+                continue
+            d = demands[r, c]
+            p = prices[r, c]
+            cap = 2.0 * s * mw
+            if p == 0.0 or d == 0.0 or cap <= 0.0:
+                continue
+            if cap < d:
+                ss = math.floor(p * (1.0 - (cap - d) / (3.0 * d)))
+            else:
+                ss = p
+            filled = d if d < cap else cap
+            rev += filled * ss
+    return rev
+
+
+def _quick_revenue_estimate_nb(demands, prices, max_pax, max_ton,
+                               max_waves, overshoot_pct):
+    R = demands.shape[0]
+    if R == 0:
+        return 0.0
+    min_eco = demands[0, 0]
+    min_bus = demands[0, 1]
+    min_fir = demands[0, 2]
+    min_cargo = demands[0, 3]
+    for r in range(1, R):
+        if demands[r, 0] < min_eco: min_eco = demands[r, 0]
+        if demands[r, 1] < min_bus: min_bus = demands[r, 1]
+        if demands[r, 2] < min_fir: min_fir = demands[r, 2]
+        if demands[r, 3] < min_cargo: min_cargo = demands[r, 3]
+
+    best = 0.0
+    tw_arr = (3, 5, 8, 10, 15, 20)
+    for ti in range(6):
+        tw = tw_arr[ti]
+        for fb in range(4):
+            fir_on = (fb >> 1) & 1
+            bus_on = fb & 1
+            fir_seats = int(min_fir / (2 * tw)) if fir_on else 0
+            if fir_seats < 0: fir_seats = 0
+            bus_seats = int(min_bus / (2 * tw)) if bus_on else 0
+            if bus_seats < 0: bus_seats = 0
+            cargo_seats = int(min_cargo / (2 * tw))
+            if cargo_seats < 0: cargo_seats = 0
+
+            eco_dem = int(min_eco / (2 * tw))
+            if eco_dem < 0: eco_dem = 0
+            eco_pay = int((max_ton - bus_seats * 0.125 - fir_seats * 0.15 - cargo_seats * 1.0) / 0.1)
+            if eco_pay < 0: eco_pay = 0
+            eco_seat = int((max_pax - bus_seats * 1.8 - fir_seats * 4.2) / 1.0)
+            if eco_seat < 0: eco_seat = 0
+            eco_seats = eco_dem
+            if eco_pay < eco_seats: eco_seats = eco_pay
+            if eco_seat < eco_seats: eco_seats = eco_seat
+
+            r = _eval_cfg_nb(eco_seats, bus_seats, fir_seats, cargo_seats,
+                             demands, prices, max_pax, max_ton, max_waves,
+                             overshoot_pct)
+            if r > best:
+                best = r
+    return best
+
+
+if njit is not None:
+    _eval_cfg_nb = njit(cache=True)(_eval_cfg_nb)
+    _quick_revenue_estimate_nb = njit(cache=True)(_quick_revenue_estimate_nb)
+
+def _search_circuits_native(routes, ac, comfort, speed, top_n, beam_width,
+                             max_steps, max_routes, max_waves, match,
+                             overshoot_pct=0.0):
+    routes_ranked = sorted(enumerate(routes), key=lambda x: -x[1]["eco_d"])
+    # The Rust RouteSet is a fixed 3xuint64 bitset: indices >= 192 would write
+    # out of bounds. Clamp the user-controllable --max-routes here.
+    top = routes_ranked[:min(max_routes, 192)]
+    M = len(top)
+
+    demands = np.empty((M, 4), dtype=np.float64)
+    prices = np.empty((M, 4), dtype=np.float64)
+    flight_times = np.empty(M, dtype=np.float64)
+    eco_demands_arr = np.empty(M, dtype=np.float64)
+    cargo_demands_arr = np.empty(M, dtype=np.float64)
+
+    for new_i, (orig_i, r) in enumerate(top):
+        demands[new_i, 0] = r["eco_d"]
+        demands[new_i, 1] = r["bus_d"]
+        demands[new_i, 2] = r["fir_d"]
+        demands[new_i, 3] = r["cargo_d"]
+        prices[new_i, 0] = ideal_eco(r["dist"], comfort)
+        prices[new_i, 1] = ideal_bus(r["dist"], comfort)
+        prices[new_i, 2] = ideal_fir(r["dist"], comfort)
+        prices[new_i, 3] = ideal_cargo(r["dist"], speed)
+        flight_times[new_i] = r["ft"]
+        eco_demands_arr[new_i] = r["eco_d"]
+        cargo_demands_arr[new_i] = r["cargo_d"]
+
+    top_idx = np.arange(M, dtype=np.int64)
+
+    raw = search_circuits_native(
+        demands, prices, flight_times, eco_demands_arr, cargo_demands_arr,
+        top_idx, float(ac["pax"]), float(ac["tonnage"]),
+        max_waves, top_n, beam_width, max_steps, match, overshoot_pct,
+    )
+
+    orig_map = [orig_i for orig_i, _ in top]
+    return [(score, total_time, frozenset(orig_map[k] for k in indices))
+            for score, total_time, indices in raw]
+
+
+def _search_circuits_python(routes, ac, comfort, speed, top_n, beam_width,
+                             max_steps, max_routes, max_waves, match,
+                             overshoot_pct=0.0):
+    routes_ranked = sorted(enumerate(routes), key=lambda x: -x[1]["eco_d"])
+    indexed = routes_ranked[:max_routes]
+
+    N = len(routes)
+    demands_full = np.empty((N, 4), dtype=np.float64)
+    prices_full = np.empty((N, 4), dtype=np.float64)
+    for i, r in enumerate(routes):
+        demands_full[i, 0] = r["eco_d"]
+        demands_full[i, 1] = r["bus_d"]
+        demands_full[i, 2] = r["fir_d"]
+        demands_full[i, 3] = r["cargo_d"]
+        prices_full[i, 0] = ideal_eco(r["dist"], comfort)
+        prices_full[i, 1] = ideal_bus(r["dist"], comfort)
+        prices_full[i, 2] = ideal_fir(r["dist"], comfort)
+        prices_full[i, 3] = ideal_cargo(r["dist"], speed)
+    max_pax_f = float(ac["pax"])
+    max_ton_f = float(ac["tonnage"])
+
+    INF = float('inf')
+    beam = [(0.0, frozenset(), INF, 0, INF, 0)]
+    best = []
+    seen = set()
+    score_cache = {}
+
+    def cached_score(indices_fs):
+        key = tuple(sorted(indices_fs))
+        if key not in score_cache:
+            if len(key) >= 2:
+                idx = np.asarray(key, dtype=np.int64)
+                score_cache[key] = _quick_revenue_estimate_nb(
+                    demands_full[idx], prices_full[idx],
+                    max_pax_f, max_ton_f, max_waves, overshoot_pct)
+            else:
+                r = routes[key[0]]
+                score_cache[key] = r["eco_d"] * ideal_eco(r["dist"], comfort)
+        return score_cache[key]
+
+    for step in range(max_steps):
+        next_beam = []
+        for time_used, indices, mn_eco, mx_eco, mn_cgo, mx_cgo in beam:
+            for i, rd in indexed:
+                if i in indices:
+                    continue
+                new_time = time_used + rd["ft"]
+                if new_time > 168:
+                    continue
+
+                new_mn_eco = min(mn_eco, rd["eco_d"])
+                new_mx_eco = max(mx_eco, rd["eco_d"])
+                new_mn_cgo = min(mn_cgo, rd["cargo_d"])
+                new_mx_cgo = max(mx_cgo, rd["cargo_d"])
+
+                if new_mx_eco > 0 and new_mn_eco / new_mx_eco < match:
+                    continue
+                if new_mx_cgo > 0 and new_mn_cgo / new_mx_cgo < match:
+                    continue
+
+                new_indices = frozenset(indices | {i})
+                key = tuple(sorted(new_indices))
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                score = cached_score(new_indices)
+
+                entry = (score, new_time, new_indices)
+                if len(best) < top_n or score > best[0][0]:
+                    heapq.heappush(best, entry)
+                    if len(best) > top_n:
+                        heapq.heappop(best)
+
+                next_beam.append((new_time, new_indices,
+                                  new_mn_eco, new_mx_eco,
+                                  new_mn_cgo, new_mx_cgo))
+
+        if len(next_beam) > beam_width:
+            next_beam.sort(key=lambda s: -cached_score(s[1]))
+            next_beam = next_beam[:beam_width]
+
+        beam = next_beam
+        if not beam:
+            break
+
+    best.sort(key=lambda x: -x[0])
+    return best
+
+
+def search_circuits(routes, ac, comfort, speed, top_n=3, beam_width=1200,
+                    max_steps=12, max_routes=150, max_waves=20, match=0.9,
+                    overshoot_pct=0.0):
+    """Beam search with demand-ratio filtering on eco + cargo.
+
+    Only expands states where eco and cargo min/max demand ratios stay
+    above the match threshold. Fir and bus are not filtered - they're
+    minor revenue contributors and the optimizer can drop them if needed.
+    """
+    if _HAS_NATIVE:
+        return _search_circuits_native(
+            routes, ac, comfort, speed, top_n, beam_width,
+            max_steps, max_routes, max_waves, match, overshoot_pct)
+    _warn_slow_path_once()
+    return _search_circuits_python(
+        routes, ac, comfort, speed, top_n, beam_width,
+        max_steps, max_routes, max_waves, match, overshoot_pct)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  PHASE 2 - Full Seat Config + Revenue Optimization
+# ═══════════════════════════════════════════════════════════════════
+
+def _circuit_breakdown(routes_list, best_cfg, best_waves):
+    breakdown = []
+    if not best_cfg or best_waves <= 0:
+        return breakdown
+    for rd in routes_list:
+        route_info = {"iata": rd["iata"], "dist": rd["dist"], "classes": []}
+        route_rev = 0
+        for cls_name, seats, price_key, dem_key in [
+            ("eco", best_cfg["eco"], "p_eco", "eco_d"),
+            ("bus", best_cfg["bus"], "p_bus", "bus_d"),
+            ("fir", best_cfg["fir"], "p_fir", "fir_d"),
+            ("cargo", best_cfg["cargo"], "p_cargo", "cargo_d"),
+        ]:
+            cap = 2 * seats * best_waves
+            dem = rd[dem_key]
+            price = rd[price_key]
+            ss = supersim_price(price, cap, dem)
+            filled = min(cap, dem)
+            cls_rev = filled * ss
+            route_rev += cls_rev
+            route_info["classes"].append({
+                "name": cls_name, "seats": seats, "cap": cap,
+                "dem": dem, "price": price, "ss_price": ss,
+                "filled": filled, "rev": cls_rev, "remaining": dem - cap,
+            })
+        route_info["rev"] = route_rev
+        breakdown.append(route_info)
+    return breakdown
+
+
+def _optimize_circuit_python(routes_list, ac, comfort=500, speed=700,
+                             max_waves=20, overshoot_pct=0.0,
+                             wave_slack=0.02):
+    """Phase 2 optimizer.
+
+    ``overshoot_pct`` controls how much over-supply is permitted on bus/fir/
+    cargo when sizing waves. 0.0 (default) is strict - capacity ≤ demand on
+    every class. 0.10 lets bus/fir/cargo cap exceed demand by up to 10% so
+    that eco (the meta) can run more waves. Eco is always strict.
+
+    ``wave_slack`` trades fleet size for revenue: among configs whose revenue
+    is within this fraction of the best found, the one with the fewest waves
+    wins. 0.02 (default) means a config needing half the aircraft is chosen
+    as long as it earns ≥98% of the maximum. 0 keeps strict revenue ranking.
+    """
+    max_pax = ac["pax"]
+    max_ton = ac["tonnage"]
+
+    for rd in routes_list:
+        rd["p_eco"] = ideal_eco(rd["dist"], comfort)
+        rd["p_bus"] = ideal_bus(rd["dist"], comfort)
+        rd["p_fir"] = ideal_fir(rd["dist"], comfort)
+        rd["p_cargo"] = ideal_cargo(rd["dist"], speed)
+
+    max_fir = min(int(max_ton / 0.15), int(max_pax / 4.2))
+    max_bus = min(int(max_ton / 0.125), int(max_pax / 1.8))
+    max_cargo = int(max_ton)
+
+    fir_step = max(1, max_fir // 12)
+    bus_step = max(1, max_bus // 20)
+    cargo_step = max(1, max_cargo // 12)
+
+    tol = 1.0 + max(0.0, overshoot_pct)
+    min_d = {k: min(rd[k] for rd in routes_list)
+             for k in ("eco_d", "bus_d", "fir_d", "cargo_d")}
+    min_eco_d = min_d["eco_d"]
+
+    def eco_seat_options(eco_max):
+        """Eco seat counts to try for one bus/fir/cargo grid point.
+
+        The physical max plus demand-limited counts that land exactly on
+        each wave target - lets the search trade eco seats for an extra
+        wave instead of stranding a fraction of a wave of eco demand.
+        """
+        opts = {eco_max}
+        for w in range(1, max_waves + 1):
+            e = int(min_eco_d / (2 * w))
+            if e < 1:
+                break
+            opts.add(min(e, eco_max))
+        return opts
+
+    def eval_config(eco, bus, fir, cargo):
+        if eco == 0 and bus == 0 and fir == 0 and cargo == 0:
+            return 0, 0
+        mw_f = float(max_waves)
+        for rd in routes_list:
+            # Eco always strict; bus/fir/cargo allowed to oversupply by `tol`.
+            for seats, dem_key, strict in [
+                (eco,   "eco_d",   True),
+                (bus,   "bus_d",   False),
+                (fir,   "fir_d",   False),
+                (cargo, "cargo_d", False),
+            ]:
+                if seats <= 0:
+                    continue
+                dem = rd[dem_key]
+                if dem <= 0:
+                    return 0, 0
+                allowed = dem if strict else dem * tol
+                wl = allowed / (2 * seats)
+                if wl < mw_f:
+                    mw_f = wl
+        mw = int(math.floor(mw_f))
+        if mw < 1:
+            return 0, 0
+        rev = 0
+        for rd in routes_list:
+            rev += daily_turnover(rd["p_eco"], 2 * eco * mw, rd["eco_d"])
+            rev += daily_turnover(rd["p_bus"], 2 * bus * mw, rd["bus_d"])
+            rev += daily_turnover(rd["p_fir"], 2 * fir * mw, rd["fir_d"])
+            rev += daily_turnover(rd["p_cargo"], 2 * cargo * mw, rd["cargo_d"])
+        return rev, mw
+
+    best_by_waves = {}  # waves -> (rev, cfg): best config found per wave count
+
+    def consider(eco, bus, fir, cargo):
+        rev, mw = eval_config(eco, bus, fir, cargo)
+        if mw < 1 or rev <= 0:
+            return
+        cur = best_by_waves.get(mw)
+        if cur is None or rev > cur[0]:
+            best_by_waves[mw] = (rev, {"eco": eco, "bus": bus,
+                                       "fir": fir, "cargo": cargo})
+
+    def pick():
+        """Fewest waves whose revenue is within wave_slack of the best."""
+        if not best_by_waves:
+            return None, 1, -1
+        top = max(r for r, _ in best_by_waves.values())
+        floor_rev = top * (1.0 - max(0.0, wave_slack))
+        w = min(w for w, (r, _) in best_by_waves.items() if r >= floor_rev)
+        rev, cfg = best_by_waves[w]
+        return cfg, w, rev
+
+    def fine_tune(cfg):
+        fc, bc, cc = cfg["fir"], cfg["bus"], cfg["cargo"]
+        for fir in range(max(0, fc - fir_step), min(max_fir, fc + fir_step) + 1):
+            for bus in range(max(0, bc - bus_step), min(max_bus, bc + bus_step) + 1):
+                for cargo in range(max(0, cc - cargo_step), min(max_cargo, cc + cargo_step) + 1):
+                    payload = fir * 0.15 + bus * 0.125 + cargo * 1.0
+                    if payload > max_ton:
+                        break
+                    seat_space = fir * 4.2 + bus * 1.8
+                    if seat_space > max_pax:
+                        break
+                    eco_max = max(0, min(int((max_ton - payload) / 0.1),
+                                         int((max_pax - seat_space) / 1.0)))
+                    for eco in eco_seat_options(eco_max):
+                        consider(eco, bus, fir, cargo)
+
+    # Coarse grid
+    for fir in range(0, max_fir + 1, fir_step):
+        for bus in range(0, max_bus + 1, bus_step):
+            for cargo in range(0, max_cargo + 1, cargo_step):
+                payload = fir * 0.15 + bus * 0.125 + cargo * 1.0
+                if payload > max_ton:
+                    break
+                seat_space = fir * 4.2 + bus * 1.8
+                if seat_space > max_pax:
+                    break
+                eco_max = max(0, min(int((max_ton - payload) / 0.1),
+                                     int((max_pax - seat_space) / 1.0)))
+                for eco in eco_seat_options(eco_max):
+                    consider(eco, bus, fir, cargo)
+
+    # Demand-balanced seeds: size every class to bottleneck exactly at w
+    # waves (each non-eco class optionally off). These are the natural
+    # "capacity ≈ demand everywhere" configs the coarse grid steps over.
+    for w in range(1, max_waves + 1):
+        for mask in range(8):
+            fir = int(min_d["fir_d"] * tol / (2 * w)) if mask & 1 else 0
+            bus = int(min_d["bus_d"] * tol / (2 * w)) if mask & 2 else 0
+            cargo = int(min_d["cargo_d"] * tol / (2 * w)) if mask & 4 else 0
+            payload = fir * 0.15 + bus * 0.125 + cargo * 1.0
+            seat_space = fir * 4.2 + bus * 1.8
+            if payload > max_ton or seat_space > max_pax:
+                continue
+            eco_max = max(0, min(int((max_ton - payload) / 0.1),
+                                 int((max_pax - seat_space) / 1.0)))
+            consider(min(int(min_eco_d / (2 * w)), eco_max), bus, fir, cargo)
+
+    # Fine-tune around the revenue leader, then around the slack pick
+    # (which may sit at a different wave count), then settle.
+    if best_by_waves:
+        fine_tune(max(best_by_waves.values(), key=lambda t: t[0])[1])
+        cfg_pick, _, _ = pick()
+        if cfg_pick:
+            fine_tune(cfg_pick)
+    best_cfg, best_waves, best_rev = pick()
+
+    return (best_cfg, best_waves, best_rev,
+            _circuit_breakdown(routes_list, best_cfg, best_waves))
+
+
+def optimize_circuit(routes_list, ac, comfort=500, speed=700, max_waves=20,
+                     overshoot_pct=0.0, wave_slack=0.02):
+    """Optimize the shared seat config in Rust, with a Python fallback."""
+    if optimize_circuit_native is None:
+        return _optimize_circuit_python(
+            routes_list, ac, comfort, speed, max_waves,
+            overshoot_pct, wave_slack)
+
+    for rd in routes_list:
+        rd["p_eco"] = ideal_eco(rd["dist"], comfort)
+        rd["p_bus"] = ideal_bus(rd["dist"], comfort)
+        rd["p_fir"] = ideal_fir(rd["dist"], comfort)
+        rd["p_cargo"] = ideal_cargo(rd["dist"], speed)
+    demands = np.array([
+        [rd["eco_d"], rd["bus_d"], rd["fir_d"], rd["cargo_d"]]
+        for rd in routes_list
+    ], dtype=np.float64)
+    prices = np.array([
+        [rd["p_eco"], rd["p_bus"], rd["p_fir"], rd["p_cargo"]]
+        for rd in routes_list
+    ], dtype=np.float64)
+    best_cfg, best_waves, best_rev = optimize_circuit_native(
+        demands, prices, ac["pax"], ac["tonnage"], max_waves,
+        overshoot_pct, wave_slack)
+    return (best_cfg, best_waves, best_rev,
+            _circuit_breakdown(routes_list, best_cfg, best_waves))
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Output
+# ═══════════════════════════════════════════════════════════════════
+
+def print_circuit(rank, ac, routes_list, total_time, cfg=None, waves=0,
+                  daily_rev=0, breakdown=None, p1_score=0, bulk_discount=0.0,
+                  bulk_threshold=63):
+    rotations = 168.0 / total_time if total_time > 0 else 0
+    gap = 168 - total_time
+    tot = {k: sum(r[k] for r in routes_list) for k in ["eco_d", "bus_d", "fir_d", "cargo_d"]}
+    mn = {k: min(r[k] for r in routes_list) for k in ["eco_d", "bus_d", "fir_d", "cargo_d"]}
+    mx = {k: max(r[k] for r in routes_list) for k in ["eco_d", "bus_d", "fir_d", "cargo_d"]}
+
+    print(f"\n{'─' * 80}")
+    print(f"  Circuit #{rank}  |  {ac['alias']} ({ac['model']})")
+    print(f"  Time: {total_time:.2f}h / 168h ({gap:.2f}h gap)  |  Rotations: {rotations:.2f}")
+    print(f"  Routes: {len(routes_list)}  |  Phase1 est: ${p1_score:,.0f}/day")
+
+    if cfg:
+        payload = cfg["eco"] * 0.1 + cfg["bus"] * 0.125 + cfg["fir"] * 0.15 + cfg["cargo"] * 1.0
+        seats = cfg["eco"] * 1.0 + cfg["bus"] * 1.8 + cfg["fir"] * 4.2
+        weekly = daily_rev * 7
+        planes = waves * 7
+
+        # Investment calculation
+        ac_unit = ac["price"]
+        discount = bulk_discount if planes >= bulk_threshold else 0
+        ac_cost = planes * ac_unit * (1 - discount)
+        route_cost = sum(r["price"] for r in routes_list)
+        total_inv = ac_cost + route_cost
+        payback_days = total_inv / daily_rev if daily_rev > 0 else float('inf')
+        roi = daily_rev * 365 / total_inv * 100 if total_inv > 0 else 0
+
+        print(f"  Config: eco={cfg['eco']}  bus={cfg['bus']}  fir={cfg['fir']}  cargo={cfg['cargo']}")
+        print(f"  Constraints: seats={seats:.0f}/{ac['pax']}  payload={payload:.1f}/{ac['tonnage']}T")
+        print(f"  Waves: {waves} ({planes} aircraft)  |  Daily: ${daily_rev:,.0f}  |  Weekly: ${weekly:,.0f}")
+        print(f"  ── Investment ──")
+        ac_line = f"  Aircraft: {planes} × ${ac_unit:,.0f} = ${planes * ac_unit:,.0f}"
+        if discount:
+            ac_line += f" → ${ac_cost:,.0f} ({discount:.0%} bulk discount)"
+        print(ac_line)
+        print(f"  Routes:   {len(routes_list)} routes = ${route_cost:,.0f}")
+        print(f"  Total:    ${total_inv:,.0f}")
+        pb_line = f"  Payback:  {payback_days:.1f} days"
+        if payback_days < 9999:
+            pb_line += f"  ({payback_days/30.44:.1f} months)"
+        print(pb_line)
+        print(f"  ROI:      {roi:.1f}%/year")
+
+    print(f"\n  Demand min - eco:{mn['eco_d']:>7,}  bus:{mn['bus_d']:>5,}  fir:{mn['fir_d']:>4,}  cargo:{mn['cargo_d']:>5,}")
+    print(f"  Demand max - eco:{mx['eco_d']:>7,}  bus:{mx['bus_d']:>5,}  fir:{mx['fir_d']:>4,}  cargo:{mx['cargo_d']:>5,}")
+    print(f"  Demand ratio (min/max) - eco:{mn['eco_d']/mx['eco_d']:.2f}  bus:{mn['bus_d']/max(1,mx['bus_d']):.2f}  "
+          f"fir:{mn['fir_d']/max(1,mx['fir_d']):.2f}  cargo:{mn['cargo_d']/max(1,mx['cargo_d']):.2f}")
+
+    print()
+    print(f"  {'IATA':<5} {'Destination':<28} {'Dist':>6} {'FT':>5}  {'Eco':>6} {'Bus':>4} {'Fir':>3} {'Cgo':>4}")
+    print(f"  {'─' * 68}")
+    for rd in sorted(routes_list, key=lambda r: -r["dist"]):
+        print(f"  {rd['iata']:<5} {rd['name'][:27]:<28} {rd['dist']:>5}km {rd['ft']:>4.2f}h "
+              f" {rd['eco_d']:>6,} {rd['bus_d']:>4,} {rd['fir_d']:>3,} {rd['cargo_d']:>4,}")
+    print(f"  {'─' * 68}")
+    print(f"  {'TOTAL':<5} {'':28} {'':>6} {total_time:>4.2f}h "
+          f" {tot['eco_d']:>6,} {tot['bus_d']:>4,} {tot['fir_d']:>3,} {tot['cargo_d']:>4,}")
+
+    # Phase 2 breakdown
+    if cfg and breakdown:
+        print()
+        print(f"  {'IATA':<5} {'Class':<6} {'Seats':>5} {'Cap':>6} {'Dem':>6} {'Rem':>6} "
+              f"{'Price':>7} {'SSPrc':>7} {'Fill%':>6} {'Revenue':>12}")
+        print(f"  {'─' * 78}")
+        for ri in breakdown:
+            route_total = ri["rev"]
+            first = True
+            for ci in ri["classes"]:
+                if ci["seats"] == 0:
+                    continue
+                fill_pct = (ci["filled"] / ci["dem"] * 100) if ci["dem"] > 0 else 0
+                label = ri["iata"] if first else ""
+                print(f"  {label:<5} {ci['name']:<6} {ci['seats']:>5} {ci['cap']:>6} {ci['dem']:>6} "
+                      f"{ci['remaining']:>6} ${ci['price']:>6,.0f} ${ci['ss_price']:>6,.0f} "
+                      f"{fill_pct:>5.1f}% ${ci['rev']:>11,.0f}")
+                first = False
+            print(f"  {'':5} {'TOTAL':<6} {'':>5} {'':>6} {'':>6} {'':>6} {'':>7} {'':>7} "
+                  f"{'':>6} ${route_total:>11,.0f}")
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Main
+# ═══════════════════════════════════════════════════════════════════
+
+def main(argv=None):
+    p = argparse.ArgumentParser(
+        prog="circuit-optimizer",
+        description="Revenue-optimised circuit planner. Reads two files you "
+                    "provide (routes and aircraft); a malformed file is rejected "
+                    "whole before anything runs.")
+    p.add_argument("--routes", required=True, metavar="FILE",
+                   help="routes for your hub (.csv or .xlsx)")
+    p.add_argument("--aircraft", required=True, metavar="FILE",
+                   help="aircraft to consider (.csv or .xlsx)")
+    p.add_argument("--only", nargs="+", metavar="MODEL",
+                   help="plan only these models from the aircraft file (default: all)")
+    p.add_argument("--circuits", type=int, default=10)
+    p.add_argument("--beam", type=int, default=1200)
+    p.add_argument("--max-routes", type=int, default=150,
+                   help="Pre-filter to top N routes by eco demand before beam search")
+    p.add_argument("--candidates-per-ac", type=int, default=3,
+                   help="Top N circuit candidates per aircraft before cross-comparison")
+    p.add_argument("--comfort", type=float, default=500)
+    p.add_argument("--speed", type=float, default=700)
+    p.add_argument("--max-waves", type=int, default=30)
+    p.add_argument("--overshoot", type=float, default=0.0,
+                   help="Allow bus/fir/cargo capacity to exceed demand by this "
+                        "fraction (e.g. 0.10 = 10%%). Eco stays strict.")
+    p.add_argument("--wave-slack", type=float, default=0.02,
+                   help="Pick the fewest-waves config within this fraction of "
+                        "max revenue (default: 0.02 = 2%%; 0 = strict max)")
+    p.add_argument("--match", type=float, default=0.9,
+                   help="Min eco/cargo demand ratio (min/max) within a circuit (default: 0.9)")
+    p.add_argument("--bulk-discount", type=float, default=0.0,
+                   help="Aircraft bulk purchase discount rate, e.g. 0.13 for 13%% (default: none)")
+    p.add_argument("--bulk-threshold", type=int, default=63,
+                   help="Min aircraft count for the bulk discount to apply (default: 63)")
+    p.add_argument("--min-dist", type=int, default=None,
+                   help="Minimum route distance in km")
+    p.add_argument("--max-dist", type=int, default=None,
+                   help="Maximum route distance in km")
+    p.add_argument("--exclude", nargs="*", default=[],
+                   help="Destination IATA codes to leave out")
+    p.add_argument("--phase1-only", action="store_true")
+    p.add_argument("--json", action="store_true",
+                   help="Print one JSON document to stdout instead of the "
+                        "human report (which moves to stderr)")
+    args = p.parse_args(argv)
+
+    try:
+        if not args.json:
+            _plan(args)
+            return
+        # stdout must carry exactly one JSON document, so the report _plan
+        # prints goes to stderr.
+        with contextlib.redirect_stdout(sys.stderr):
+            doc = _plan(args)
+    except dataio.DataError as e:
+        print(f"REJECTED: {e}", file=sys.stderr)
+        sys.exit(2)
+    json.dump(doc, sys.stdout, indent=2)
+    print()
+
+
+def _plan(args):
+    """Run the planner, printing the human-readable report to stdout.
+
+    Always builds and returns the structured result document; main() discards
+    it unless --json was given. Raises dataio.DataError before printing
+    anything if either input file is malformed.
+    """
+    all_routes = dataio.load_routes(args.routes)
+    aircraft_list = dataio.load_aircraft(args.aircraft)
+    if args.only:
+        by_model = {ac["model"].upper(): ac for ac in aircraft_list}
+        unknown = [m for m in args.only if m.upper() not in by_model]
+        if unknown:
+            sys.exit(f"error: not in {args.aircraft}: {', '.join(unknown)}")
+        aircraft_list = [by_model[m.upper()] for m in args.only]
+
+    exclude_base = {x.upper() for x in (args.exclude or [])}
+
+    print(f"{'=' * 80}")
+    print("CIRCUIT PLANNER, revenue optimised")
+    print(f"{'=' * 80}")
+    print(f"Comfort: {args.comfort}  |  Speed: {args.speed}")
+    print(f"Circuits: {args.circuits}  |  Max waves: {args.max_waves}  |  Match: {args.match:.0%}")
+    dist_filter = []
+    if args.min_dist:
+        dist_filter.append(f">={args.min_dist:,}km")
+    if args.max_dist:
+        dist_filter.append(f"<={args.max_dist:,}km")
+    if dist_filter:
+        print(f"Distance filter: {' and '.join(dist_filter)}")
+    if exclude_base:
+        print(f"Excluded: {' '.join(sorted(exclude_base))}")
+    for ac in aircraft_list:
+        print(f"  {ac['alias']:>4} - {ac['model']:<12} cat>={ac['cat']}  {ac['speed']}km/h  "
+              f"range={ac['range']:,}km  pax={ac['pax']}  ton={ac['tonnage']}T")
+    for ac in aircraft_list:
+        routes = eligible_routes(all_routes, ac, exclude_iatas=exclude_base,
+                                 min_dist=args.min_dist, max_dist=args.max_dist)
+        print(f"  {ac['alias']}: {len(routes)} eligible routes")
+    print(f"{'=' * 80}")
+
+    used_routes = set()
+    all_circuits = []
+    t0 = _time.time()
+
+    for circuit_num in range(1, args.circuits + 1):
+        current_exclude = exclude_base | used_routes
+
+        # Phase 1: search per aircraft
+        candidates = []
+        for ac in aircraft_list:
+            routes = eligible_routes(all_routes, ac, exclude_iatas=current_exclude,
+                                     min_dist=args.min_dist, max_dist=args.max_dist)
+            if len(routes) < 2:
+                continue
+
+            print(f"  {ac['alias']} ({len(routes)}r, top {args.max_routes})...",
+                  end="", flush=True)
+            results = search_circuits(
+                routes, ac, args.comfort, args.speed,
+                top_n=args.candidates_per_ac, beam_width=args.beam,
+                max_routes=args.max_routes, max_waves=args.max_waves,
+                match=args.match, overshoot_pct=args.overshoot,
+            )
+            if results:
+                print(f" best=${results[0][0]:,.0f}/day", flush=True)
+            else:
+                print(" no results", flush=True)
+
+            for score, total_time, indices in results:
+                route_list = [routes[i] for i in indices]
+                candidates.append((score, total_time, route_list, ac))
+
+        if not candidates:
+            print(f"\nCircuit #{circuit_num}: no viable circuits remaining")
+            break
+
+        if args.phase1_only:
+            p1_score, total_time, route_list, best_ac = max(
+                candidates, key=lambda candidate: candidate[0])
+            cfg, waves, daily_rev, breakdown = None, 0, 0, None
+        else:
+            evaluated = []
+            for p1_score, total_time, route_list, ac in candidates:
+                cfg, waves, daily_rev, breakdown = optimize_circuit(
+                    route_list, ac, comfort=args.comfort, speed=args.speed,
+                    max_waves=args.max_waves, overshoot_pct=args.overshoot,
+                    wave_slack=args.wave_slack,
+                )
+                evaluated.append((daily_rev, p1_score, total_time, route_list,
+                                  ac, cfg, waves, breakdown))
+            (daily_rev, p1_score, total_time, route_list, best_ac,
+             cfg, waves, breakdown) = max(
+                evaluated, key=lambda candidate: (candidate[0], candidate[1]))
+
+        # Lock routes
+        used_routes |= set(r["iata"] for r in route_list)
+
+        # Phase 2
+        if not args.phase1_only:
+            print_circuit(circuit_num, best_ac, route_list, total_time,
+                          cfg, waves, daily_rev, breakdown, p1_score,
+                          bulk_discount=args.bulk_discount,
+                          bulk_threshold=args.bulk_threshold)
+            all_circuits.append((circuit_num, best_ac, route_list, total_time,
+                                 p1_score, cfg, waves, daily_rev))
+        else:
+            print_circuit(circuit_num, best_ac, route_list, total_time, p1_score=p1_score)
+            all_circuits.append((circuit_num, best_ac, route_list, total_time,
+                                 p1_score, None, 0, 0))
+
+    elapsed = _time.time() - t0
+
+    # Summary
+    print(f"\n{'=' * 80}")
+    print(f"SUMMARY, {len(all_circuits)} circuits, {elapsed:.1f}s")
+    print(f"{'=' * 80}")
+    print()
+
+    total_routes_used = 0
+    total_weekly = 0
+    total_investment = 0
+    total_planes = 0
+    ac_usage = {}
+    results = []
+
+    if not args.phase1_only:
+        print(f"  {'#':>2}  {'AC':<4}  {'Time':>7}  {'Rt':>2}  {'Waves':>5}  {'Planes':>6}  "
+              f"{'Config':<22}  {'Weekly T/O':>14}  {'Investment':>14}  {'Payback':>9}  {'ROI/yr':>7}")
+        print(f"  {'─' * 115}")
+
+    for entry in all_circuits:
+        num, ac = entry[0], entry[1]
+        route_list, total_time = entry[2], entry[3]
+        p1_score = entry[4]
+        cfg, waves, daily_rev = entry[5], entry[6], entry[7]
+
+        iatas = " ".join(r["iata"] for r in sorted(route_list, key=lambda r: -r["dist"]))
+        total_routes_used += len(route_list)
+        ac_usage[ac["alias"]] = ac_usage.get(ac["alias"], 0) + 1
+
+        res = {
+            "num": num,
+            "aircraft": ac["alias"],
+            "model": ac["model"],
+            "total_hours": round(total_time, 2),
+            "p1_score": round(p1_score, 2),
+            "routes": [
+                {"iata": r["iata"], "name": r["name"], "dist": r["dist"],
+                 "ft": round(r["ft"], 2), "eco_d": r["eco_d"], "bus_d": r["bus_d"],
+                 "fir_d": r["fir_d"], "cargo_d": r["cargo_d"], "price": r["price"]}
+                for r in sorted(route_list, key=lambda r: -r["dist"])
+            ],
+            "cfg": dict(cfg) if cfg else None,
+            "waves": waves,
+            "daily_rev": None, "weekly_rev": None,
+            "investment": None, "route_investment": None,
+            "payback_days": None, "roi_pct_year": None,
+        }
+        results.append(res)
+
+        if cfg and not args.phase1_only:
+            weekly = daily_rev * 7
+            planes = waves * 7
+            total_weekly += weekly
+            total_planes += planes
+            # Investment
+            discount = args.bulk_discount if planes >= args.bulk_threshold else 0
+            ac_cost = planes * ac["price"] * (1 - discount)
+            route_cost = sum(r["price"] for r in route_list)
+            total_inv = ac_cost + route_cost
+            payback_days = total_inv / daily_rev if daily_rev > 0 else 0
+            roi = daily_rev * 365 / total_inv * 100 if total_inv > 0 else 0
+            total_investment += total_inv
+            res.update({
+                "daily_rev": round(daily_rev, 2),
+                "weekly_rev": round(weekly, 2),
+                "investment": round(total_inv, 2),
+                "route_investment": round(route_cost, 2),
+                "payback_days": round(payback_days, 2),
+                "roi_pct_year": round(roi, 2),
+            })
+            cfg_str = f"e{cfg['eco']} b{cfg['bus']} f{cfg['fir']} c{cfg['cargo']}"
+            print(f"  #{num:>2}  {ac['alias']:<4}  {total_time:>6.2f}h  {len(route_list):>2}r  "
+                  f"{waves:>5}w  {planes:>5}ac  {cfg_str:<22}  ${weekly:>13,.0f}  "
+                  f"${total_inv:>13,.0f}  {payback_days:>7.1f}d  {roi:>6.1f}%")
+        else:
+            print(f"  #{num:>2}  {ac['alias']}  {total_time:>6.2f}h  {len(route_list):>2}r  "
+                  f"est=${p1_score:>13,.0f}/day  {iatas}")
+
+    print(f"\n  Routes used: {total_routes_used}")
+    print(f"  Aircraft mix: {', '.join(f'{k}×{v}' for k, v in sorted(ac_usage.items()))}")
+    if not args.phase1_only:
+        print(f"  Total aircraft: {total_planes}")
+        print(f"  Total Weekly Turnover: ${total_weekly:>14,.0f}")
+        print(f"  Total Investment:      ${total_investment:>14,.0f}")
+        overall_daily = total_weekly / 7 if total_weekly > 0 else 0
+        overall_payback_days = total_investment / overall_daily if overall_daily > 0 else 0
+        overall_roi = overall_daily * 365 / total_investment * 100 if total_investment > 0 else 0
+        print(f"  Overall Payback:       {overall_payback_days:>10.1f} days ({overall_payback_days/30.44:.1f} months)")
+        print(f"  Overall ROI:           {overall_roi:>10.1f}%/year")
+    print(f"  Locked IATAs: {' '.join(sorted(used_routes))}")
+
+    return {"elapsed_s": round(elapsed, 2), "circuits": results}

@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "circuit-optimizer"
+version = "0.1.0"
+description = "Revenue-optimised circuit planner. Bring your own data as a CSV or Excel file."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.26", "openpyxl>=3.1"]
+
+[project.optional-dependencies]
+fast = ["numba>=0.60"]   # JIT for the Python search; skip it if you build the native core
+dev = ["pytest>=8.2"]
+
+[project.scripts]
+circuit-optimizer = "circuit_optimizer.planner:main"
+
+[tool.setuptools]
+packages = ["circuit_optimizer"]
+
+[tool.setuptools.package-data]
+circuit_optimizer = ["native/beam_search.rs", "native/build.sh"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

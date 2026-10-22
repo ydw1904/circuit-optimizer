@@ -1,0 +1,4 @@
+model,category,speed_kmh,range_km,max_pax,max_tonnage,price
+DEMO-S,1,800,9000,190,18.5,45000000
+DEMO-M,2,900,14000,420,48.0,150000000
+DEMO-L,3,950,18000,720,92.5,310000000
