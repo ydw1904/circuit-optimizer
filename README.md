@@ -65,8 +65,8 @@ quarter hour:
 t_r = \tfrac{1}{4}\left\lceil 8\left(\frac{\mathrm{dist}_r}{v} + 1\right)\right\rceil
 ```
 
-The decisions are a route set $S \subseteq R$, one seat configuration $s = (s_e, s_b, s_f, s_c)$ of
-whole numbers, and the wave count $w$:
+The decisions are a route set $S \subseteq R$, one seat configuration
+$s = (s_e, s_b, s_f, s_c) \in \mathbb{Z}_{\ge 0}^4$, and the wave count $w$:
 
 ```math
 \begin{aligned}
@@ -216,29 +216,29 @@ Two files, each `.csv` (UTF-8, comma or semicolon separated) or `.xlsx` (first s
 
 **Routes file**: one row per candidate destination of one hub.
 
-|Column|Meaning|Allowed|
-|-|-|-|
-|`iata`|destination code|3 letters|
-|`name`|display name|text, up to 60 characters|
-|`distance_km`|distance from the hub|whole number, 1 to 20100|
-|`category`|destination category|whole number, 1 to 10|
-|`eco_demand`|economy demand|whole number, at least 1|
-|`bus_demand`|business demand|whole number, 0 or more|
-|`first_demand`|first class demand|whole number, 0 or more|
-|`cargo_demand`|cargo demand|whole number, 0 or more|
-|`route_price`|cost to open the route|whole number, 0 or more (0 = unknown, left out of payback)|
+|Column|Meaning|Type|Allowed values|
+|-|-|-|-|
+|`iata`|destination code|string|exactly 3 letters A to Z, any case|
+|`name`|display name|string|printable, at most 60 characters|
+|`distance_km`|distance from the hub|integer|1 to 20,100|
+|`category`|destination category|integer|1 to 10|
+|`eco_demand`|economy demand|integer|1 to 1,000,000|
+|`bus_demand`|business demand|integer|0 to 1,000,000|
+|`first_demand`|first class demand|integer|0 to 1,000,000|
+|`cargo_demand`|cargo demand|integer|0 to 1,000,000|
+|`route_price`|cost to open the route|integer|0 to 10<sup>12</sup> (0 = unknown, left out of payback)|
 
 **Aircraft file**: one row per model you want considered.
 
-|Column|Meaning|Allowed|
-|-|-|-|
-|`model`|name you will use with `--only`|text, up to 60 characters, unique|
-|`category`|aircraft category (flies routes of this category or higher)|whole number, 1 to 10|
-|`speed_kmh`|cruise speed|whole number, 1 or more|
-|`range_km`|maximum range|whole number, 1 or more|
-|`max_pax`|seat capacity|whole number, 0 or more|
-|`max_tonnage`|payload in tonnes|number, decimals allowed, above 0|
-|`price`|purchase price per aircraft|whole number, 0 or more|
+|Column|Meaning|Type|Allowed values|
+|-|-|-|-|
+|`model`|name you will use with `--only`|string|printable, at most 60 characters, unique|
+|`category`|aircraft category (flies routes of this category or higher)|integer|1 to 10|
+|`speed_kmh`|cruise speed|integer|1 to 10,000|
+|`range_km`|maximum range|integer|1 to 40,000|
+|`max_pax`|seat capacity|integer|0 to 5,000|
+|`max_tonnage`|payload in tonnes|float|0.1 to 1,000|
+|`price`|purchase price per aircraft|integer|0 to 10<sup>12</sup>|
 
 ### Files are accepted whole or rejected whole
 
@@ -250,9 +250,9 @@ row and column:
 REJECTED: routes.csv row 14: 'eco_demand' must be a plain number, got '4,500'
 ```
 
-Rejected: missing, unknown or duplicated columns; empty cells; text where a number belongs;
-thousands separators, units or scientific notation (`4,500`, `4500 km`, `1e3`); fractions in
-whole-number columns; values out of range; a repeated `iata` or `model`; files with no data rows;
+Rejected: missing, unknown or duplicated columns; empty cells; a string where a number belongs;
+thousands separators, units or scientific notation (`4,500`, `4500 km`, `1e3`); a fractional value in
+an integer column; values out of range; a repeated `iata` or `model`; files with no data rows;
 files over 5 MB or 10,000 rows; unreadable or corrupt files; any other file type.
 
 Fine: any column order, upper or lower case codes, a UTF-8 BOM, semicolon separators (Excel in many
