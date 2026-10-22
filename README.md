@@ -53,6 +53,86 @@ only about a third of the shortfall. Seat count is far more valuable than price.
 therefore looks for **routes with similar demand**, so one configuration fits all of them near
 their ideal price. It doesn't pick routes first and repair the mismatch with pricing afterwards.
 
+### The optimisation problem
+
+For one aircraft model with seat capacity $P$, payload $T$ tonnes and cruise speed $v$, let $R$ be
+the eligible routes (in range, category high enough, round trip within the week) and
+$K = \{e, b, f, c\}$ the classes economy, business, first and cargo. Each route $r$ has a demand
+$d_{r,k}$ and an ideal price $p_{r,k}$ per class, and a round-trip time in hours rounded up to a
+quarter hour:
+
+```math
+t_r = \tfrac{1}{4}\left\lceil 8\left(\frac{\mathrm{dist}_r}{v} + 1\right)\right\rceil
+```
+
+The decisions are a route set $S \subseteq R$, one seat configuration $s = (s_e, s_b, s_f, s_c)$ of
+whole numbers, and the wave count $w$:
+
+```math
+\begin{aligned}
+\max_{S,\ s,\ w}\quad & \mathrm{Rev}(S, s, w) = \sum_{r \in S} \sum_{k \in K} \min(d_{r,k},\, C_{r,k})\ \pi_{r,k},
+  \qquad C_{r,k} = 2\, s_k\, w \\
+\text{s.t.}\quad & \textstyle\sum_{r \in S} t_r \le 168 && \text{(one week)} \\
+& s_e + 1.8\, s_b + 4.2\, s_f \le P && \text{(cabin space)} \\
+& 0.1\, s_e + 0.125\, s_b + 0.15\, s_f + s_c \le T && \text{(payload)} \\
+& 2\, s_k\, w \le \tau_k\, d_{r,k} \quad \forall r \in S,\ k : s_k > 0 && \text{(no oversupply)} \\
+& 1 \le w \le W_{\max} && \text{(}\texttt{--max-waves}\text{, default 30)}
+\end{aligned}
+```
+
+where $\tau_e = 1$ and $\tau_b = \tau_f = \tau_c = 1 + \text{overshoot}$ (`--overshoot`). Undersupplied
+legs are priced to fill:
+
+```math
+\pi_{r,k} = \begin{cases}
+p_{r,k} & C_{r,k} \ge d_{r,k} \\[2pt]
+\left\lfloor p_{r,k}\left(1 + \dfrac{d_{r,k} - C_{r,k}}{3\, d_{r,k}}\right)\right\rfloor & C_{r,k} < d_{r,k}
+\end{cases}
+```
+
+Revenue rises with $w$, so for a fixed $S$ and $s$ the best $w$ is the largest one the
+oversupply rule allows:
+
+```math
+w^*(S, s) = \min\left(W_{\max},\ \left\lfloor \min_{r \in S,\ k : s_k > 0} \frac{\tau_k\, d_{r,k}}{2\, s_k} \right\rfloor\right)
+```
+
+Ideal prices come from distance, the comfort level $\kappa$ (`--comfort`, default 500) and the
+cargo speed $\sigma$ (`--speed`, default 700):
+
+```math
+\begin{aligned}
+p_{r,e} &= \lfloor 100 + 0.3\, \mathrm{dist}_r (1 + \kappa / 3000) \rfloor, \qquad
+p_{r,b} = \lfloor 1.33\, p_{r,e} \rfloor, \qquad
+p_{r,f} = \lfloor 2.3\, p_{r,e} \rfloor \\
+p_{r,c} &= \lceil 200 + \alpha_r\, \mathrm{dist}_r (1 + \sigma / 500) \rceil, \qquad
+\alpha_r = 0.56,\ 0.52,\ 0.47 \text{ for } \mathrm{dist}_r \le 1999,\ \le 5000,\ \text{above}
+\end{aligned}
+```
+
+Three rules sit on top of the objective.
+
+- **Fleet size.** Among configurations whose revenue is at least $(1 - \varepsilon)$ of the best
+  (`--wave-slack`, $\varepsilon = 0.02$), the one with the fewest waves wins, since it needs $7w$
+  aircraft.
+- **Aircraft model.** The problem is solved per model and the circuit goes to the model with the
+  highest revenue.
+- **Several circuits.** They are planned greedily, one after another, and each chosen $S$ is
+  removed from $R$ before the next.
+
+The planner doesn't solve this exactly: there are far too many route sets. The search narrows the
+space with heuristics: at most 12 routes, only the 150 routes with the most economy demand
+(`--max-routes`), the demand similarity filter
+$\min_{r \in S} d_{r,k} \ge \mu \max_{r \in S} d_{r,k}$ for $k \in \{e, c\}$ (`--match`,
+$\mu = 0.9$), and a grid over $s_b, s_f, s_c$.
+
+The report then measures the plan as an investment, with aircraft price $a$, route opening prices
+$q_r$ and bulk discount $\delta$ (`--bulk-discount`, applied once $7w$ reaches `--bulk-threshold`):
+
+```math
+\text{payback days} = \frac{7w \cdot a\,(1 - \delta) + \sum_{r \in S} q_r}{\mathrm{Rev}}
+```
+
 ## How it works
 
 The search runs in two phases, once per aircraft model, and repeats per circuit. Once a circuit is
